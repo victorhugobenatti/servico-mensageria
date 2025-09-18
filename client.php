@@ -10,7 +10,7 @@
  * /sendfile USER CAMINHO_ARQUIVO
  */
 
-$addr = 'tcp://127.0.0.1:12345';
+$addr = 'tcp://127.0.0.1:8888';
 $fp = stream_socket_client($addr, $errno, $errstr, 5);
 if (!$fp) die("Erro: $errstr ($errno)\n");
 stream_set_blocking($fp, false);

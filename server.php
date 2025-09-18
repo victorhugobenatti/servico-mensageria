@@ -13,13 +13,13 @@
  */
 
 set_time_limit(0);
-$addr = 'tcp://0.0.0.0:12345';
+$addr = 'tcp://0.0.0.0:8888';
 $server = @stream_socket_server($addr, $errno, $errstr);
 if (!$server) die("Erro: $errstr ($errno)\n");
 stream_set_blocking($server, false);
 
-$clients = []; // id => ['stream'=>resource, 'username'=>null]
-$userMap = []; // username => clientId
+$clients = [];
+$userMap = [];
 
 // Conexão ao banco SQLite
 $db = new PDO('sqlite:chat.db');
@@ -30,19 +30,19 @@ initDb($db);
 echo "Servidor ouvindo $addr...\n";
 
 while (true) {
-	$read = [$server];
+	$reads = [$server];
 
 	foreach ($clients as $c){
-		$read[] = $c['stream'];
+		$reads[] = $c['stream'];
 	}
 
 	$write = $except = null;
 
-	if (stream_select($read, $write, $except, 0, 200000) === false) 
+	if (stream_select($reads, $write, $except, 0, 200000) === false) 
 		break;
 
 	// nova conexão
-	if (in_array($server, $read, true)) {
+	if (in_array($server, $reads, true)) {
 		$new = @stream_socket_accept($server, 0);
 		
 		if ($new) {
@@ -52,23 +52,30 @@ while (true) {
 			fwrite($new, json_encode(["type"=>"welcome","msg"=>"Conectado"]) . "\n");
 			echo "Novo cliente $id conectado.\n";
 		}
-		$idx = array_search($server, $read, true);
-		unset($read[$idx]);
+		$idx = array_search($server, $reads, true);
+		unset($reads[$idx]);
 	}
 
 	// tratar mensagens dos clientes
-	foreach ($read as $r) {
-		$id = (int)$r;
-		$line = fgets($r);
-		if ($line === false) { // desconectou
+	foreach ($reads as $read) {
+		$id = (int)$read;
+		$line = fgets($read);
+
+		// cliente desconectou-se
+		if ($line === false) {
 			disconnectClient($id);
 			continue;
 		}
+
 		$line = trim($line);
-		if ($line === '') continue;
+
+		if ($line === '') 
+			continue;
 
 		$msg = json_decode($line, true);
-		if (!$msg) continue;
+
+		if (!$msg) 
+			continue;
 
 		handleMessage($id, $msg);
 	}
@@ -153,7 +160,6 @@ function handleMessage($id, $msg) {
 			break;
 
 		case 'file':
-			// Header recebido, agora ler bytes do arquivo
 			$from = $clients[$id]['username'];
 			$to = $msg['to'];
 			$fname = $msg['name'];
