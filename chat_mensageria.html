@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Chat Mensageria (WebSocket) — Frontend</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+  <style>
+    body { background: #f7fafc; }
+    .sidebar { height: 78vh; overflow-y: auto; }
+    .messages { height: 60vh; overflow-y: auto; padding: 1rem; background: #fff; border-radius: .5rem; }
+    .msg-me { background: #e6f7ff; margin-left: auto; }
+    .msg-other { background: #ffffff; margin-right: auto; }
+    .msg-bubble { padding: .5rem .75rem; border-radius: .5rem; box-shadow: 0 1px 2px rgba(0,0,0,0.04); max-width: 70%; }
+    .small-muted { font-size: .75rem; color: #6c757d; }
+    .file-link { display:inline-block; margin-top:.3rem; }
+    .conversation-item { cursor: pointer; }
+  </style>
+</head>
+<body>
+<div class="container py-4">
+  <div class="d-flex align-items-center justify-content-between mb-3">
+    <h3>Mensageria Distribuída (Frontend)</h3>
+    <div id="connStatus" class="badge bg-secondary">desconectado</div>
+  </div>
+
+  <div class="row g-3">
+    <!-- left: config + conversations -->
+    <div class="col-md-4">
+      <div class="card mb-3">
+        <div class="card-body">
+          <div class="mb-2"><strong>Servidor WebSocket</strong></div>
+          <div class="input-group mb-2">
+            <input id="serverUrl" class="form-control" value="ws://localhost/servico-mensageria/server.php">
+            <button id="btnConnect" class="btn btn-primary">Conectar</button>
+            <button id="btnDisconnect" class="btn btn-outline-secondary d-none">Desconectar</button>
+          </div>
+
+          <div class="mb-2"><small class="text-muted">Identidade</small></div>
+          <div class="mb-2"><input id="userId" class="form-control mb-1" placeholder="userId" value="alice"></div>
+          <div class="mb-2"><input id="username" class="form-control mb-1" placeholder="username" value="Alice"></div>
+          <div class="mb-2"><input id="token" class="form-control" placeholder="token (opcional)"></div>
+        </div>
+      </div>
+
+      <div class="card sidebar">
+        <div class="card-body">
+          <div class="d-flex justify-content-between align-items-center mb-2">
+            <strong>Conversas</strong>
+            <div>
+              <button class="btn btn-sm btn-outline-primary" id="btnNewDM">+ DM</button>
+              <button class="btn btn-sm btn-outline-success" id="btnNewGroup">+ Grupo</button>
+            </div>
+          </div>
+          <ul id="conversations" class="list-group list-group-flush"></ul>
+          <hr>
+          <div><strong>Online</strong></div>
+          <div id="onlineUsers" class="mt-2"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- right: messages -->
+    <div class="col-md-8">
+      <div class="card">
+        <div class="card-header d-flex justify-content-between align-items-center">
+          <div>
+            <h5 id="convTitle" class="mb-0">Nenhuma conversa selecionada</h5>
+            <small id="convMeta" class="text-muted"></small>
+          </div>
+          <div>
+            <button id="btnJoinRoom" class="btn btn-sm btn-outline-secondary d-none">Entrar</button>
+          </div>
+        </div>
+        <div class="card-body">
+          <div id="messages" class="messages mb-3"></div>
+
+          <div class="row g-2 align-items-center">
+            <div class="col-md-8">
+              <textarea id="textInput" class="form-control" rows="2" placeholder="Digite sua mensagem..."></textarea>
+              <div class="form-text small-muted">Enter envia (Shift+Enter pula linha).</div>
+            </div>
+            <div class="col-md-4">
+              <input id="fileInput" type="file" class="form-control mb-2">
+              <div class="d-flex gap-2 justify-content-end">
+                <button id="btnSend" class="btn btn-primary">Enviar</button>
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+      <div class="mt-3 small text-muted">Observações: arquivos são enviados como base64 no JSON para simplicidade. Para produção, prefira upload via HTTP e referencie no chat.</div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ---------- Estado local ----------
+let ws = null;
+let connAttempt = 0;
+let lastPong = Date.now();
+let hbInterval = null;
+
+const conversations = {}; // id -> { id, label, kind, peerId?, roomId?, messages: [] }
+let activeConvId = null;
+const onlineUsers = [];
+
+// --------- Helpers ----------
+function $id(x){ return document.getElementById(x); }
+function now(){ return Date.now(); }
+function genId(){ return 'c-' + Math.random().toString(36).slice(2,10); }
+
+function backoff(attempt, base=500, max=8000){
+  const jitter = (Math.random()*0.3)+0.85;
+  return Math.min(max, Math.floor(base * Math.pow(2, attempt) * jitter));
+}
+
+// --------- UI ----------
+function setConnStatus(text, cls){
+  const el = $id('connStatus');
+  el.textContent = text;
+  el.className = 'badge ' + (cls||'bg-secondary');
+}
+
+function renderConversations(){
+  const ul = $id('conversations'); ul.innerHTML = '';
+  const arr = Object.values(conversations).sort((a,b)=>{
+    const at = a.messages[a.messages.length-1]?.timestamp || 0;
+    const bt = b.messages[b.messages.length-1]?.timestamp || 0;
+    return bt-at;
+  });
+  arr.forEach(c=>{
+    const li = document.createElement('li');
+    li.className = 'list-group-item d-flex justify-content-between align-items-start conversation-item ' + (activeConvId===c.id? 'active':'');
+    li.onclick = ()=>{ selectConversation(c.id); };
+    li.innerHTML = `<div><div class="fw-semibold">${escapeHtml(c.label)}</div><div class="small text-muted">${c.kind==='dm' ? ('DM • '+c.peerId) : ('Grupo • '+c.roomId)}</div></div><div>${c.unread?'<span class="badge bg-danger">'+c.unread+'</span>':''}</div>`;
+    ul.appendChild(li);
+  });
+}
+
+function renderMessages(){
+  const box = $id('messages'); box.innerHTML = '';
+  if(!activeConvId){ $id('convTitle').textContent='Nenhuma conversa selecionada'; $id('convMeta').textContent=''; return; }
+  const conv = conversations[activeConvId];
+  $id('convTitle').textContent = conv.label;
+  $id('convMeta').textContent = conv.kind==='dm'? ('Privado • '+conv.peerId):('Grupo • '+conv.roomId);
+
+  conv.messages.forEach(m=>{
+    const div = document.createElement('div');
+    const mine = (m.from && m.from.id === $id('userId').value);
+    div.className = 'd-flex ' + (mine? 'justify-content-end':'');
+    const inner = document.createElement('div');
+    inner.className = 'msg-bubble ' + (mine? 'msg-me':'msg-other');
+    inner.innerHTML = `<div class="small-muted mb-1 d-flex justify-content-between"><div>${escapeHtml(m.from.name)}</div><div>${new Date(m.timestamp).toLocaleTimeString()}</div></div>`;
+    if(m.text) inner.innerHTML += `<div>${escapeHtml(m.text).replace(/\n/g,'<br>')}</div>`;
+    if(m.file){
+      const a = document.createElement('a');
+      a.href = `data:${m.file.mime};base64,${m.file.data}`;
+      a.download = m.file.name;
+      a.className = 'file-link';
+      a.textContent = `${m.file.name} (${Math.round(m.file.size/1024)} KB)`;
+      inner.appendChild(a);
+    }
+    if(m.from.id === $id('userId').value){
+      const status = document.createElement('div');
+      status.className = 'small-muted text-end mt-1';
+      status.textContent = m.status || '';
+      inner.appendChild(status);
+    }
+    div.appendChild(inner);
+    box.appendChild(div);
+  });
+  box.scrollTop = box.scrollHeight;
+}
+
+function renderOnline(){
+  const target = $id('onlineUsers'); target.innerHTML = '';
+  onlineUsers.forEach(u=>{
+    const btn = document.createElement('button');
+    btn.className = 'btn btn-sm btn-outline-secondary me-1 mb-1';
+    btn.textContent = u.name;
+    btn.onclick = ()=>{ ensureDM(u.id, u.name); };
+    target.appendChild(btn);
+  });
+}
+
+function escapeHtml(s){ return String(s||'').replace(/[&<>\"']/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":"&#39;"}[c]; }); }
+
+// --------- Conversation management ----------
+function ensureDM(peerId, name){
+  const id = 'dm:'+peerId;
+  if(!conversations[id]){
+    conversations[id] = { id, label: name, kind:'dm', peerId, messages: [], unread:0 };
+  }
+  activeConvId = id; renderConversations(); renderMessages();
+}
+function ensureGroup(roomId, label){
+  const id = 'grp:'+roomId;
+  if(!conversations[id]){
+    conversations[id] = { id, label: label||('Grupo '+roomId), kind:'group', roomId, messages: [], unread:0 };
+  }
+  activeConvId = id; renderConversations(); renderMessages();
+  // send join
+  if(ws && ws.readyState===WebSocket.OPEN){ ws.send(JSON.stringify({ type:'join', roomId })); }
+}
+
+function selectConversation(id){ activeConvId = id; if(conversations[id]) conversations[id].unread = 0; renderConversations(); renderMessages(); }
+
+// --------- Sending messages ----------
+async function sendMessage(text, file){
+  if(!activeConvId) return alert('Selecione uma conversa');
+  if(!ws || ws.readyState!==WebSocket.OPEN) return alert('Sem conexão');
+  const conv = conversations[activeConvId];
+  const clientMsgId = genId();
+  let filePayload = null;
+  if(file){
+    filePayload = await fileToBase64(file);
+    filePayload = { name: file.name, mime: file.type || 'application/octet-stream', data: filePayload.split(',')[1], size: file.size };
+  }
+  const msg = {
+    id: clientMsgId,
+    clientMsgId,
+    from: { id: $id('userId').value, name: $id('username').value },
+    text: text || undefined,
+    file: filePayload || undefined,
+    timestamp: now(),
+    status: 'sending'
+  };
+  // optimistic UI
+  conv.messages.push(msg); renderMessages(); renderConversations();
+
+  const payload = conv.kind==='group'
+    ? { type:'group', roomId: conv.roomId, text: text||undefined, file: filePayload||undefined, clientMsgId }
+    : { type:'dm', toUserId: conv.peerId, text: text||undefined, file: filePayload||undefined, clientMsgId };
+
+  ws.send(JSON.stringify(payload));
+}
+
+function fileToBase64(file){
+  return new Promise((res,rej)=>{
+    const r = new FileReader();
+    r.onload = ()=>res(r.result);
+    r.onerror = ()=>rej(r.error);
+    r.readAsDataURL(file);
+  });
+}
+
+// --------- WebSocket lifecycle ----------
+function connect(){
+  if(ws) return;
+  const url = $id('serverUrl').value;
+  setConnUIConnecting();
+  try{
+    ws = new WebSocket(url);
+  }catch(e){ setConnStatus('URL inválida', 'bg-danger'); return; }
+
+  ws.onopen = ()=>{
+    connAttempt = 0; setConnStatus('conectado','bg-success'); $id('btnConnect').classList.add('d-none'); $id('btnDisconnect').classList.remove('d-none');
+    // auth
+    const auth = { type:'auth', userId:$id('userId').value, username:$id('username').value, token:$id('token').value };
+    ws.send(JSON.stringify(auth));
+    // heartbeat
+    if(hbInterval) clearInterval(hbInterval);
+    hbInterval = setInterval(()=>{
+      if(ws && ws.readyState===WebSocket.OPEN){ ws.send(JSON.stringify({ type:'ping', t: now() })); }
+      if(Date.now() - lastPong > 20000){ // sem pong por >20s
+        try{ ws.close(); }catch(e){}
+      }
+    }, 5000);
+  };
+
+  ws.onmessage = (ev)=>{
+    try{
+      const msg = JSON.parse(ev.data);
+      handleServerMessage(msg);
+    }catch(e){ console.warn('não-JSON', e); }
+  };
+
+  ws.onclose = ()=>{
+    ws = null; setConnStatus('desconectado','bg-secondary'); $id('btnConnect').classList.remove('d-none'); $id('btnDisconnect').classList.add('d-none');
+    if(hbInterval){ clearInterval(hbInterval); hbInterval = null; }
+    // reconectar com backoff
+    connAttempt += 1; const delay = backoff(connAttempt);
+    console.log('tentando reconectar em', delay, 'ms');
+    setTimeout(()=>{ connect(); }, delay);
+  };
+
+  ws.onerror = (e)=>{ console.error('ws erro', e); };
+}
+
+function disconnect(){ if(ws){ ws.close(); ws=null; } }
+
+function setConnUIConnecting(){ setConnStatus('conectando...','bg-warning'); }
+
+// --------- Handle server messages ----------
+function handleServerMessage(msg){
+  switch(msg.type){
+    case 'pong': lastPong = now(); break;
+    case 'presence':
+      // example: { type:'presence', users: [{id,name}, ...] }
+      if(Array.isArray(msg.users)){
+        onlineUsers.length = 0; msg.users.forEach(u=>onlineUsers.push(u)); renderOnline();
+      }
+      break;
+    case 'ack':
+      // { type:'ack', clientMsgId, serverMsgId }
+      const clientId = msg.clientMsgId;
+      for(const cid in conversations){
+        const conv = conversations[cid];
+        const idx = conv.messages.findIndex(m=>m.clientMsgId===clientId);
+        if(idx>=0){ conv.messages[idx].id = msg.serverMsgId; conv.messages[idx].status = 'delivered'; renderMessages(); break; }
+      }
+      break;
+    case 'message':
+      // { type:'message', message: { id, roomId?, toUserId?, from, text, file?, timestamp } }
+      const m = msg.message;
+      const isGroup = !!m.roomId;
+      const convId = isGroup ? ('grp:'+m.roomId) : ('dm:'+ (m.from.id === $id('userId').value ? m.toUserId : m.from.id));
+      const label = isGroup ? ('Grupo '+m.roomId) : (m.from.id === $id('userId').value ? ('DM '+m.toUserId) : m.from.name);
+      if(!conversations[convId]){
+        conversations[convId] = { id:convId, label, kind: isGroup? 'group':'dm', peerId: isGroup? undefined : (m.from.id === $id('userId').value ? m.toUserId : m.from.id), roomId: isGroup? m.roomId: undefined, messages:[], unread:0 };
+      }
+      conversations[convId].messages.push(Object.assign({}, m, { status:'sent' }));
+      if(activeConvId !== convId) conversations[convId].unread += 1;
+      renderConversations(); renderMessages();
+      // send ack
+      if(ws && ws.readyState===WebSocket.OPEN && m.id){ ws.send(JSON.stringify({ type:'ack', messageId: m.id })); }
+      break;
+    case 'error':
+      console.error('server-error', msg); break;
+    case 'connected':
+      // server confirms
+      break;
+    default:
+      console.log('unknown msg', msg); break;
+  }
+}
+
+// --------- UI events ----------
+$id('btnConnect').addEventListener('click', ()=>connect());
+$id('btnDisconnect').addEventListener('click', ()=>disconnect());
+$id('btnNewDM').addEventListener('click', ()=>{
+  const peer = prompt('ID do usuário para DM:'); if(!peer) return; const name = prompt('Nome do usuário:') || peer; ensureDM(peer, name);
+});
+$id('btnNewGroup').addEventListener('click', ()=>{
+  const room = prompt('ID do grupo:'); if(!room) return; const name = prompt('Nome do grupo:') || ('Grupo '+room); ensureGroup(room, name);
+});
+
+$id('btnSend').addEventListener('click', async ()=>{
+  const text = $id('textInput').value.trim(); const file = $id('fileInput').files[0];
+  await sendMessage(text, file);
+  $id('textInput').value=''; $id('fileInput').value='';
+});
+
+// Enter to send
+$id('textInput').addEventListener('keydown', (e)=>{
+  if(e.key==='Enter' && !e.shiftKey){ e.preventDefault(); $id('btnSend').click(); }
+});
+
+// Init minimal sample conv
+// ensureDM('bob','Bob'); // uncomment to seed
+renderConversations(); renderOnline(); renderMessages();
+
+</script>
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>

@@ -1,10 +1,8 @@
--- schema.sql - Estrutura do banco SQLite para o chat (arquitetura transacional)
+-- schema.sql - Estrutura inicial do banco SQLite para o chat
 
 CREATE TABLE IF NOT EXISTS users (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  username TEXT UNIQUE,
-  ip TEXT,
-  port INTEGER
+  username TEXT UNIQUE
 );
 
 CREATE TABLE IF NOT EXISTS groups (
@@ -29,3 +27,4 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   delivered INTEGER DEFAULT 0
 );
+
